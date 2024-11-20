@@ -1,1 +1,6 @@
 langchain
+langchain-ollama
+langchain_community
+pypdf
+pydantic
+docarray
