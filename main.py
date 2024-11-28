@@ -1,11 +1,7 @@
 import time
-from lib import load_and_split_pdf, get_cached_components, create_chroma_vector_store
+from lib import load_and_split_pdf, initialize_components, create_vector_store, query_vector_store
 from config import DATASET_PDF_PATH
-from log import get_logger
-from pydantic import ValidationError
 
-# Initialize the logger
-logger = get_logger(__name__)
 
 def main(question):
     """
@@ -21,48 +17,34 @@ def main(question):
     try:
         # Step 1: Load and split PDF
         pages = load_and_split_pdf(DATASET_PDF_PATH)
+        print(f"Loaded {len(pages)} chunks.")
 
         # Step 2: Initialize components
-        components = get_cached_components()
+        components = initialize_components()
         model = components["model"]
         embeddings = components["embeddings"]
         prompt = components["general_prompt"]
         parser = components["parser"]
 
         # Step 3: Create vector store
-        vectorstore = create_chroma_vector_store(pages, embeddings)
-
-        # Step 4: Query the vector store and invoke the chain
-
-        retriever = vectorstore.as_retriever()
+        faiss_index, doc_id_mapping = create_vector_store(pages, embeddings)
 
         start_time = time.time()
 
-        # Retrieve relevant documents
-        logger.info("Retrieving context from vector store...")
-        # context_docs = retriever.invoke(question)
-        context_docs = retriever.get_relevant_documents(question)
-        if not context_docs:
-            logger.error("No relevant context found in the vector store.")
-            return
-        context = " ".join([doc.page_content for doc in context_docs])
-        logger.info(f"Retrieved context: ...")
-        print(context)
+        # Step 4: Query the FAISS vector store
+        context_chunks = query_vector_store(faiss_index, doc_id_mapping, embeddings, question, top_k=5)
+        context = " ".join(context_chunks)
+
         # Prepare chain input
-        logger.info("Initializing Chain...")
         chain_input = {
             "context": context,
             "question": question,
         }
 
-
         # Invoke the chain
         chain = prompt | model | parser
-        logger.info("Chain initialized successfully.")
-
-        logger.info("Generating test cases...")
         response = chain.invoke(chain_input)
-        logger.info("Test cases generated successfully.")
+
         end_time = time.time()
 
         # Print results

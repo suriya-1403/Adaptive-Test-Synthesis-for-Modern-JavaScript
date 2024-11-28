@@ -3,37 +3,34 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_ollama import OllamaLLM, OllamaEmbeddings
 from langchain_core.output_parsers import StrOutputParser
 from langchain.prompts import PromptTemplate
-from langchain_community.vectorstores import DocArrayInMemorySearch
-from config import DATASET_PDF_PATH, MODEL_NAME, SPLIT_PAGES_PATH, VECTOR_STORE_PATH
-from constants import PROMPT_TEMPLATE
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from config import DATASET_PDF_PATH, MODEL_NAME
 from log import get_logger
-from langchain_chroma import Chroma
-from langchain.docstore.document import Document
 from pydantic import ValidationError
-import pickle
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+import faiss
+import numpy as np
 
 # Initialize the logger
 logger = get_logger(__name__)
 
-# Initialize the components cache
-_components_cache = None
 
-def load_and_split_pdf(file_path=None):
+def load_and_split_pdf(file_path=None, chunk_size=500, chunk_overlap=50):
     """
-    Load and split a PDF into pages using PyPDFLoader.
+    Load and split a PDF into smaller chunks using RecursiveCharacterTextSplitter.
 
     :param file_path: str, optional
         Custom file path to the PDF. Defaults to the dataset PDF path from the config.
+    :param chunk_size: int
+        Maximum size of each chunk.
+    :param chunk_overlap: int
+        Overlap between chunks to maintain context.
     :return: list
-        List of pages extracted from the PDF.
+        List of chunks extracted from the PDF.
     :raises FileNotFoundError:
         If the file does not exist.
     :raises Exception:
         If any other error occurs during the PDF loading and splitting process.
     """
-
     # Use the provided file_path or default to DATASET_PDF_PATH
     path_to_pdf = file_path or DATASET_PDF_PATH
     logger.info(f"Using PDF file path: {path_to_pdf}")
@@ -44,37 +41,31 @@ def load_and_split_pdf(file_path=None):
         raise FileNotFoundError(f"PDF file not found at path: {path_to_pdf}")
 
     try:
-        # Load and split the PDF
-        logger.info("Starting to load and split the PDF...")
+        # Load the PDF
+        logger.info("Starting to load the PDF...")
         loader = PyPDFLoader(file_path=str(path_to_pdf))
-        pages = loader.load_and_split()
-        logger.info(f"Successfully loaded and split the PDF into {len(pages)} pages.")
-        return pages
+        pages = loader.load()
+
+        logger.info(f"Loaded {len(pages)} pages from the PDF.")
+
+        # Initialize the text splitter
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap
+        )
+
+        # Split each page into smaller chunks
+        logger.info("Splitting pages into smaller chunks...")
+        chunks = []
+        for page in pages:
+            chunks.extend(text_splitter.split_text(page.page_content))
+
+        logger.info(f"Successfully split the PDF into {len(chunks)} chunks.")
+        return chunks
     except Exception as e:
         logger.exception("An error occurred while loading and splitting the PDF.")
         raise
 
-def import_or_split_pdf(file_path, save_path=SPLIT_PAGES_PATH):
-    """
-    Load split PDF pages from a saved file or split the PDF if not available.
-
-    :param file_path: str
-        The path to the original PDF.
-    :param save_path: str
-        The path to the saved split pages.
-    :return: list
-        The split PDF pages.
-    """
-    if os.path.exists(save_path):
-        logger.info(f"Loading split pages from {save_path}...")
-        with open(save_path, "rb") as f:
-            pages = pickle.load(f)
-        logger.info(f"Loaded {len(pages)} pages from saved file.")
-    else:
-        logger.info("Split pages not found. Splitting the PDF...")
-        pages = load_and_split_pdf(file_path)
-        save_pages(pages, save_path)
-    return pages
 
 def initialize_components():
     """
@@ -86,15 +77,11 @@ def initialize_components():
         - **embeddings** (OllamaEmbeddings): The embedding model.
         - **parser** (StrOutputParser): The output parser.
         - **general_prompt** (PromptTemplate): The general-purpose prompt template.
-        - **test_case_prompt** (PromptTemplate): The specialized prompt template for generating test cases.
-    :raises Exception:
-        If any error occurs during initialization.
-    """
+        """
     try:
         logger.info("Initializing LangChain components...")
 
         # Initialize the LLM model
-        # model = Ollama(model=MODEL_NAME)
         model = OllamaLLM(model=MODEL_NAME)
         logger.info(f"LLM model '{MODEL_NAME}' initialized.")
 
@@ -107,7 +94,22 @@ def initialize_components():
         logger.info("Output parser initialized.")
 
         # Initialize the general-purpose prompt template
-        general_prompt_template = PROMPT_TEMPLATE
+        general_prompt_template = """
+        You are a JavaScript testing expert. Your task is to generate test cases for the given function based on its specification.
+
+        Please ensure the following while generating the test cases:
+        1. Use the provided context as the authoritative specification for the function's behavior.
+        2. Generate test cases that cover:
+           - Typical use cases.
+           - Edge cases, including boundary conditions and special values.
+           - Invalid inputs, ensuring proper error handling, if applicable.
+        3. The output should only include JavaScript code with `assert` statements. Do not include comments or explanations.
+        4. Ensure the test cases are valid and adhere to the provided specification.
+
+        Context: {context}
+
+        Question: {question}
+        """
         general_prompt = PromptTemplate(template=general_prompt_template)
         logger.info("General-purpose prompt template initialized.")
 
@@ -121,112 +123,85 @@ def initialize_components():
         logger.exception("Error during component initialization.")
         raise error
 
-def create_chroma_vector_store(pages, embeddings, persist_directory=VECTOR_STORE_PATH):
+
+def create_vector_store(chunks, embeddings, nlist=100):
     """
-    Create a Chroma vector store from the provided pages using embeddings.
+    Create a FAISS vector store from the provided chunks using an Inverted File Index (IVF).
 
-    :param pages: list
-        List of pages extracted from the PDF.
-    :param embeddings: Embeddings
-        The embedding model for vectorization.
-    :param persist_directory: str
-        The directory to store the persistent Chroma database.
-    :return: Chroma
-        A Chroma vector store object.
-    """
-    try:
-        persist_path = Path(persist_directory)
-        persist_path.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
-
-        logger.info("Creating Chroma vector store...")
-
-        # Convert pages into Documents
-        documents = [
-            Document(page_content=page.page_content, metadata={"page": i})
-            for i, page in enumerate(pages)
-        ]
-
-        # Create the Chroma vector store
-        vector_store = Chroma.from_documents(
-            documents=documents,
-            embedding=embeddings,
-            persist_directory=str(persist_path),
-        )
-
-        # Persist data locally
-        vector_store.persist()
-        logger.info(f"Chroma vector store created and persisted at {persist_path}.")
-        return vector_store
-    except Exception as error:
-        logger.exception("An error occurred while creating the Chroma vector store.")
-        raise error
-
-def load_or_create_chroma_vector_store(pages, embeddings, persist_directory=VECTOR_STORE_PATH):
-    """
-    Load an existing Chroma vector store from disk or create a new one if not available.
-
-    :param pages: list
-        The list of pages to create the vector store if needed.
-    :param embeddings: Embeddings
-        The embedding model for vectorization.
-    :param persist_directory: str
-        The directory to store or load the persistent Chroma database.
-    :return: Chroma
-        The loaded or newly created Chroma vector store.
+    :param chunks: list
+        List of text chunks extracted from the PDF.
+    :param embeddings: OllamaEmbeddings
+        Embedding model for vectorization.
+    :param nlist: int, optional
+        Number of clusters for the Inverted File Index. Defaults to 100.
+    :return: tuple
+        A tuple containing:
+        - The FAISS IVF index (faiss.IndexIVFFlat).
+        - A mapping of document IDs to their corresponding chunks.
+    :raises Exception:
+        If any error occurs during vector store creation.
     """
     try:
-        persist_path = Path(persist_directory)
-        persist_path.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
+        logger.info("Creating FAISS vector store using IVF...")
 
-        if persist_path.exists():
-            logger.info(f"Loading Chroma vector store from {persist_directory}...")
-            vector_store = Chroma(persist_directory=str(persist_path), embedding_function=embeddings)
-            logger.info("Chroma vector store loaded successfully.")
-        else:
-            logger.info("Chroma vector store not found. Creating a new one...")
-            vector_store = create_chroma_vector_store(pages, embeddings, str(persist_path))
-        return vector_store
+        # Use embed_query to generate embeddings
+        embedding_vectors = np.array([embeddings.embed_query(chunk) for chunk in chunks]).astype('float32')
+
+        # Determine the dimensionality of the embeddings
+        dimension = embedding_vectors.shape[1]
+
+        # Initialize the quantizer (Flat index for clustering)
+        quantizer = faiss.IndexFlatL2(dimension)  # Base index for clustering
+        logger.info(f"Quantizer initialized with dimension {dimension}.")
+
+        # Create an IVF index
+        index = faiss.IndexIVFFlat(quantizer, dimension, nlist)  # IVF index with `nlist` clusters
+
+        # Train the index (mandatory for IVF)
+        index.train(embedding_vectors)
+        logger.info(f"IVF index trained with {nlist} clusters.")
+
+        # Add the embeddings to the index
+        index.add(embedding_vectors)
+        logger.info("Embeddings added to the FAISS IVF index.")
+
+        # Create a mapping of document IDs to their content
+        doc_id_mapping = {i: chunk for i, chunk in enumerate(chunks)}
+        logger.info("Document ID mapping created.")
+
+        return index, doc_id_mapping
     except Exception as error:
-        logger.exception("An error occurred while loading or creating the Chroma vector store.")
+        logger.exception("An error occurred while creating the FAISS vector store using IVF.")
         raise error
 
-def get_cached_components():
-    """
-    Get cached LangChain components or initialize them if not already cached.
 
-    :return: dict
-        A dictionary containing LangChain components.
-    """
-    global _components_cache
-    if _components_cache is None:
-        _components_cache = initialize_components()
-    return _components_cache
 
-def save_pages(pages, file_path):
-    """
-    Save the split PDF pages to a file.
 
-    :param pages: list
-        The list of split pages.
-    :param file_path: str
-        The path to save the pages.
-    """
-    with open(file_path, "wb") as f:
-        pickle.dump(pages, f)
-    logger.info(f"PDF pages saved to {file_path}.")
 
-def parallel_retrieve_context(vector_store, queries):
+def query_vector_store(index, doc_id_mapping, embeddings, query, top_k=5):
     """
-    Retrieve contexts for multiple queries in parallel.
+    Query the FAISS vector store to retrieve the most relevant chunks.
 
-    :param vector_store: Chroma
-        The vector store to query.
-    :param queries: list
-        The list of queries to retrieve contexts for.
+    :param index: faiss.IndexIVFFlat
+        The FAISS IVF index.
+    :param doc_id_mapping: dict
+        A mapping of document IDs to their content.
+    :param embeddings: OllamaEmbeddings
+        The embedding model.
+    :param query: str
+        The query text.
+    :param top_k: int, optional
+        Number of top results to retrieve. Defaults to 5.
     :return: list
-        The list of retrieved contexts.
+        List of the most relevant chunks.
     """
-    retriever = vector_store.as_retriever()
-    with ThreadPoolExecutor() as executor:
-        results = list(executor.map(retriever.get_relevant_documents, queries))
+    # Generate embedding for the query
+    query_vector = np.array([embeddings.embed_query(query)]).astype('float32')
+
+    # Perform the search
+    distances, indices = index.search(query_vector, top_k)
+
+    # Map results back to document chunks
+    results = [doc_id_mapping[idx] for idx in indices[0]]
     return results
+
